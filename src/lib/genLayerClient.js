@@ -1,12 +1,12 @@
 import { createClient } from 'genlayer-js';
 import { studionet } from 'genlayer-js/chains';
-import { TransactionStatus } from 'genlayer-js/types';
 import {
   CONTRACT_ADDRESS,
-  ABI,
-  TX_POLL_INTERVAL,
-  TX_POLL_RETRIES
+  ABI
 } from '../constants';
+
+const RESULT_WAIT_TIMEOUT_MS = 45 * 1000;
+const RESULT_POLL_INTERVAL_MS = 1500;
 
 export function buildGenLayerClient(accountAddress) {
   return createClient({
@@ -15,8 +15,44 @@ export function buildGenLayerClient(accountAddress) {
   });
 }
 
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function readTimestamp(client, naturalTime) {
+  const rawTimestamp = await client.readContract({
+    address: CONTRACT_ADDRESS,
+    abi: ABI,
+    functionName: 'get_timestamp',
+    args: [naturalTime]
+  });
+  return Number(rawTimestamp);
+}
+
+async function pollTimestampForNewValue(client, naturalTime, previousValue, onStatus) {
+  const maxAttempts = Math.ceil(RESULT_WAIT_TIMEOUT_MS / RESULT_POLL_INTERVAL_MS);
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const value = await readTimestamp(client, naturalTime);
+    if (value > 0 && value !== previousValue) return value;
+
+    if (attempt % 5 === 0) {
+      onStatus?.('Waiting for result... checking onchain state.');
+    }
+    await delay(RESULT_POLL_INTERVAL_MS);
+  }
+
+  return 0;
+}
+
 export async function convertTime(accountAddress, naturalTime, onStatus) {
   const client = buildGenLayerClient(accountAddress);
+  let previousValue = 0;
+
+  try {
+    previousValue = await readTimestamp(client, naturalTime);
+  } catch {
+    previousValue = 0;
+  }
 
   onStatus?.('Submitting transaction...');
 
@@ -28,40 +64,25 @@ export async function convertTime(accountAddress, naturalTime, onStatus) {
     value: BigInt(0)
   });
 
-  onStatus?.('Waiting for LLM consensus... (this can take 30-90 seconds)');
+  onStatus?.('Transaction sent. Fetching resolved timestamp...');
 
-  const receipt = await client.waitForTransactionReceipt({
-    hash: txHash,
-    status: TransactionStatus.FINALIZED,
-    retries: TX_POLL_RETRIES,
-    interval: TX_POLL_INTERVAL
-  });
+  const timestamp = await pollTimestampForNewValue(
+    client,
+    naturalTime,
+    previousValue,
+    onStatus
+  );
 
-  if (!receipt) {
-    throw new Error('Transaction did not finalize within the timeout window.');
+  if (timestamp <= 0) {
+    throw new Error(
+      `No new timestamp written within 45s for tx ${txHash}. Retry once, then use "Get Cached Timestamp".`
+    );
   }
 
-  onStatus?.('Reading resolved timestamp...');
-
-  const rawTimestamp = await client.readContract({
-    address: CONTRACT_ADDRESS,
-    abi: ABI,
-    functionName: 'get_timestamp',
-    args: [naturalTime]
-  });
-
-  return Number(rawTimestamp);
+  return timestamp;
 }
 
 export async function getCachedTimestamp(accountAddress, naturalTime) {
   const client = buildGenLayerClient(accountAddress);
-
-  const rawTimestamp = await client.readContract({
-    address: CONTRACT_ADDRESS,
-    abi: ABI,
-    functionName: 'get_timestamp',
-    args: [naturalTime]
-  });
-
-  return Number(rawTimestamp);
+  return readTimestamp(client, naturalTime);
 }
